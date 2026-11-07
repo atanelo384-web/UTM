@@ -1,0 +1,118 @@
+name: VM (iPhone)
+
+on:
+  push:
+    branches: [vm]
+    paths:
+      - 'vm/**'
+      - '.github/workflows/vm.yml'
+  workflow_dispatch:
+    inputs:
+      build_sysroot:
+        description: 'Build QEMU and its libraries from source instead of reusing the UTM v5.0.8 build'
+        required: true
+        default: 'false'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: vm-build
+  cancel-in-progress: true
+
+env:
+  # Sysroot-ios-arm64 from the utmapp/UTM CI run of the v5.0.8 release (expires 2027-01-15)
+  UTM_SYSROOT_ARTIFACT: '12087377615'
+
+jobs:
+  build:
+    name: Build VM.ipa
+    runs-on: macos-26
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Xcode
+        run: |
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Restore sysroot
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ./sysroot-iOS-arm64
+          key: vm-sysroot-ios-arm64-${{ hashFiles('scripts/build_dependencies.sh', 'scripts/fixup.sh') }}-${{ hashFiles('patches/**') }}
+
+      - name: Download sysroot built by UTM
+        id: download
+        if: steps.cache.outputs.cache-hit != 'true' && github.event.inputs.build_sysroot != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eo pipefail
+          curl -fL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -o sysroot.zip "https://api.github.com/repos/utmapp/UTM/actions/artifacts/$UTM_SYSROOT_ARTIFACT/zip"
+          unzip -q sysroot.zip
+          rm sysroot.zip
+          tar -xf sysroot.tgz
+          rm sysroot.tgz
+          ls -d sysroot-*
+          test -d sysroot-iOS-arm64/Frameworks
+
+      - name: Install build requirements
+        if: steps.cache.outputs.cache-hit != 'true' && steps.download.outcome != 'success'
+        run: |
+          echo "/usr/local/opt/bison/bin:/opt/homebrew/opt/bison/bin" >> $GITHUB_PATH
+          brew uninstall cmake || true
+          brew install bison pkg-config gettext glib-utils libgpg-error nasm make meson cmake
+          brew install llvm spirv-llvm-translator libxcb libxrandr
+          pip3 install --break-system-packages --user six pyparsing pyyaml setuptools distlib mako
+          rm -f /usr/local/lib/pkgconfig/*.pc
+
+      - name: Build sysroot from source
+        if: steps.cache.outputs.cache-hit != 'true' && steps.download.outcome != 'success'
+        run: ./scripts/build_dependencies.sh -p ios -a arm64
+
+      - name: Save sysroot
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ./sysroot-iOS-arm64
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Turn UTM into VM
+        run: python3 vm/patch_utm.py .
+
+      - name: Build
+        run: |
+          set -o pipefail
+          ./scripts/build_utm.sh -k iphoneos -s iOS -a arm64 -o VM 2>&1 | tee build.log | grep -E "error:|warning: .*VM/|BUILD|ARCHIVE" || true
+          test -d VM.xcarchive
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Package IPA
+        run: |
+          brew install ldid
+          mkdir -p out
+          ./scripts/package.sh ipa VM.xcarchive out
+          mv out/UTM.ipa VM.ipa
+          ls -la VM.ipa
+          unzip -l VM.ipa | grep -E "Info.plist$|/UTM$" | head
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: VM-ipa
+          path: VM.ipa
+          compression-level: 0
