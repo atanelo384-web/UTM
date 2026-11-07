@@ -28,7 +28,8 @@ env:
 jobs:
   build:
     name: Build VM.ipa
-    runs-on: macos-26
+    # UTM 5.0.8 uses the iOS 27 SDK
+    runs-on: xcode-27
     timeout-minutes: 350
     steps:
       - name: Checkout
@@ -90,7 +91,8 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          ./scripts/build_utm.sh -k iphoneos -s iOS -a arm64 -o VM 2>&1 | tee build.log | grep -E "error:|warning: .*VM/|BUILD|ARCHIVE" || true
+          ./scripts/build_utm.sh -k iphoneos -s iOS -a arm64 -o VM > build.log 2>&1 || true
+          grep -E "error:|warning: .*/VM/|\*\* ARCHIVE" build.log | sort -u | head -100 || true
           test -d VM.xcarchive
 
       - name: Upload build log
