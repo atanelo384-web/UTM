@@ -57,12 +57,12 @@ enum VMDevice {
         "iPhone16,2": ("iPhone 15 Pro Max", 460),
     ]
 
-    static var modelName: String {
+    @MainActor static var modelName: String {
         models[machine]?.name ?? (machine.isEmpty ? UIDevice.current.model : machine)
     }
 
     /// Pixels per inch of the built-in screen.
-    static var ppi: Int {
+    @MainActor static var ppi: Int {
         models[machine]?.ppi ?? Int((UIScreen.main.nativeScale * 163).rounded())
     }
 
@@ -105,7 +105,7 @@ enum VMDevice {
         return "\(Int(gib.rounded(.up))) ГБ"
     }
 
-    static var iosVersion: String { "iOS \(UIDevice.current.systemVersion)" }
+    @MainActor static var iosVersion: String { "iOS \(UIDevice.current.systemVersion)" }
 
     /// Bytes this process may still allocate before iOS terminates it.
     static var appMemoryAvailable: Int { Int(os_proc_available_memory()) }
@@ -118,7 +118,7 @@ enum VMDevice {
         return (free, total)
     }
 
-    static var screenPixels: (width: Int, height: Int) {
+    @MainActor static var screenPixels: (width: Int, height: Int) {
         let b = UIScreen.main.nativeBounds.size
         let w = Int(min(b.width, b.height)), h = Int(max(b.width, b.height))
         return (w, h)
@@ -158,7 +158,7 @@ struct VMAndroidInfo {
     var version: String
     var android: String
 
-    init(config: UTMQemuConfiguration?) {
+    @MainActor init(config: UTMQemuConfiguration?) {
         let notes = config?.information.notes ?? ""
         var lineage = ""
         for line in notes.components(separatedBy: .newlines) where line.contains("Initial version:") {
@@ -185,7 +185,7 @@ enum VMResolution: String, CaseIterable, Identifiable {
     case half
     var id: String { rawValue }
 
-    var size: (width: Int, height: Int) {
+    @MainActor var size: (width: Int, height: Int) {
         let s = VMDevice.screenPixels
         switch self {
         case .native: return s
@@ -193,14 +193,14 @@ enum VMResolution: String, CaseIterable, Identifiable {
         }
     }
 
-    var density: Int {
+    @MainActor var density: Int {
         switch self {
         case .native: return VMDevice.ppi
         case .half: return VMDevice.ppi / 2
         }
     }
 
-    var title: String {
+    @MainActor var title: String {
         let s = size
         return "\(s.width)×\(s.height) · \(density) ppi"
     }
