@@ -18,7 +18,10 @@ struct VMHomeView: View {
 
     private var vm: VMData? { shell.androidVM(in: data) }
     private var config: UTMQemuConfiguration? { vm?.config as? UTMQemuConfiguration }
-    private var pending: UTMPendingVirtualMachine? { data.pendingVMs.first }
+    private var pending: UTMPendingVirtualMachine? { shell.pendingDownload }
+
+    /// From the moment Start is pressed only Android should be on the screen.
+    private var isLaunching: Bool { shell.isPreparing }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -35,6 +38,16 @@ struct VMHomeView: View {
             settingsButton
         }
         .background(Color(.systemGroupedBackground).ignoresSafeArea())
+        .overlay {
+            if isLaunching {
+                ZStack {
+                    Color.black.ignoresSafeArea()
+                    ProgressView().progressViewStyle(.circular).tint(.white)
+                }
+            }
+        }
+        .statusBarHidden(isLaunching)
+        .modifier(VMSystemOverlaysModifier(hidden: isLaunching))
         .alert(item: $shell.message) { m in
             Alert(title: Text(m.title), message: Text(m.text), dismissButton: .default(Text("OK")))
         }
@@ -70,9 +83,8 @@ struct VMHomeView: View {
                 }
             }
         }
-        .onChange(of: data.pendingVMs.count) { count in
-            if count == 0 {
-                UIApplication.shared.isIdleTimerDisabled = false
+        .onChange(of: shell.isInstallingAndroid) { installing in
+            if !installing {
                 refreshStorage()
             }
         }
@@ -117,7 +129,9 @@ struct VMHomeView: View {
                 VMInfoRow(title: "Экран", value: settings.resolution.title)
                 VMInfoRow(title: "JIT", value: jit.isEnabled ? "включён" : "включится при старте", valueColor: jit.isEnabled ? .green : .secondary)
             } else if let pending = pending {
-                VMDownloadProgressView(pending: pending)
+                VMDownloadProgressView(pending: pending, unpackProgress: shell.unpackProgress)
+            } else if let unpack = shell.unpackProgress {
+                VMUnpackProgressView(progress: unpack)
             } else {
                 Divider()
                 Text("Образ Android скачается из интернета один раз: \(vmFormatBytes(VMAndroidImage.downloadSize)), после распаковки займёт около \(vmFormatBytes(VMAndroidImage.unpackedSize)). Пока идёт загрузка, не закрывайте приложение.")
@@ -125,7 +139,7 @@ struct VMHomeView: View {
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if !shell.hasSpaceForDownload {
-                    Text("Мало свободного места: нужно хотя бы \(vmFormatBytes(VMAndroidImage.downloadSize + VMAndroidImage.unpackedSize + 500_000_000)).")
+                    Text("Мало свободного места: нужно хотя бы \(vmFormatBytes(shell.spaceNeededForInstall)).")
                         .font(.footnote)
                         .foregroundColor(.red)
                         .fixedSize(horizontal: false, vertical: true)
@@ -181,7 +195,7 @@ struct VMHomeView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
                 .disabled(shell.isPreparing || isStartPendingJIT)
-            } else if pending == nil {
+            } else if !shell.isInstallingAndroid {
                 Button {
                     shell.download(into: data)
                 } label: {
@@ -262,17 +276,14 @@ struct VMInfoRow: View {
 
 struct VMDownloadProgressView: View {
     @ObservedObject var pending: UTMPendingVirtualMachine
+    var unpackProgress: Double?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Divider()
             if pending.downloadProgress >= 1 {
-                HStack(spacing: 8) {
-                    ProgressView()
-                    Text("Распаковка образа…")
-                        .font(.subheadline)
-                }
+                VMUnpackProgressView(progress: unpackProgress ?? 0)
             } else {
+                Divider()
                 ProgressView(value: Double(pending.downloadProgress))
                 HStack {
                     Text("Загрузка \(Int(pending.downloadProgress * 100))%")
@@ -288,11 +299,41 @@ struct VMDownloadProgressView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
+                Button("Отменить", role: .destructive) {
+                    pending.cancel()
+                }
+                .font(.footnote)
             }
-            Button("Отменить", role: .destructive) {
-                pending.cancel()
-            }
-            .font(.footnote)
+        }
+    }
+}
+
+struct VMUnpackProgressView: View {
+    let progress: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            ProgressView(value: progress)
+            Text("Распаковка Android \(Int(progress * 100))% — не закрывайте приложение")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+/// Hides the home indicator (it comes back faintly only while the screen is touched near it)
+/// and gives edge swipes to the content first.
+struct VMSystemOverlaysModifier: ViewModifier {
+    let hidden: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 16, *) {
+            content
+                .persistentSystemOverlays(hidden ? .hidden : .automatic)
+                .defersSystemGestures(on: hidden ? .all : [])
+        } else {
+            content
         }
     }
 }

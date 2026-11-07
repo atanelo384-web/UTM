@@ -7,6 +7,7 @@ import SwiftUI
 import UIKit
 import Darwin
 import os
+import ZIPFoundation
 
 // MARK: - Device information
 
@@ -150,6 +151,118 @@ enum VMAndroidImage {
     static let unpackedSize: Int64 = 2_256_477_261
     /// Byte offset of the GRUB environment block inside Data/vda.qcow2 of that exact release.
     static let knownGrubEnvOffset: UInt64 = 0x86303200
+
+    /// The downloaded archive is kept here until it has been unpacked, so a failed unpack does not cost a new download.
+    static var cachedZipURL: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("android-lineage.zip")
+    }
+
+    static var hasCompleteCachedZip: Bool {
+        let size = (try? FileManager.default.attributesOfItem(atPath: cachedZipURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+        return size == downloadSize
+    }
+}
+
+// MARK: - Download and unpack
+
+/// Unpacks the .utm package from a VM archive.
+///
+/// UTM's own importer needs a separate directory entry for the package, which the LineageOS
+/// archives do not have (they only list the files inside it), so the package is found from the
+/// paths of its files instead.
+enum VMZip {
+    struct UnpackError: LocalizedError {
+        let errorDescription: String?
+    }
+
+    static func extractUTM(zipURL: URL, into folder: URL) throws -> URL {
+        guard let archive = Archive(url: zipURL, accessMode: .read) else {
+            throw UnpackError(errorDescription: "Не удалось открыть скачанный архив.")
+        }
+        var root: String?
+        for entry in archive where !entry.path.contains("__MACOSX") {
+            if let r = entry.path.range(of: ".utm/") {
+                root = String(entry.path[..<r.upperBound])
+                break
+            }
+        }
+        guard let root = root else {
+            throw UnpackError(errorDescription: "В архиве нет виртуальной машины (.utm).")
+        }
+        let entries = archive.filter { $0.path.hasPrefix(root) && $0.path.count > root.count && !$0.path.contains("__MACOSX") }
+        let total = entries.reduce(Int64(0)) { $0 + Int64($1.uncompressedSize) }
+        let free = VMDevice.storage().free
+        guard free > total + 200_000_000 else {
+            throw UnpackError(errorDescription: "Для распаковки нужно \(vmFormatBytes(total + 200_000_000)) свободного места, а свободно \(vmFormatBytes(free)).")
+        }
+
+        let fm = FileManager.default
+        let packageName = URL(fileURLWithPath: String(root.dropLast())).lastPathComponent
+        var destination = folder.appendingPathComponent(packageName, isDirectory: true)
+        var index = 2
+        while fm.fileExists(atPath: destination.path) {
+            destination = folder.appendingPathComponent(packageName.replacingOccurrences(of: ".utm", with: " (\(index)).utm"), isDirectory: true)
+            index += 1
+        }
+        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+
+        var done: Int64 = 0
+        var lastReported = -1
+        func report() {
+            let percent = total > 0 ? Int(done * 100 / total) : 0
+            if percent != lastReported {
+                lastReported = percent
+                let value = Double(percent) / 100
+                Task { @MainActor in
+                    VMShell.shared.unpackProgress = value
+                }
+            }
+        }
+        do {
+            for entry in entries {
+                let relative = String(entry.path.dropFirst(root.count))
+                guard entry.type != .symlink, !relative.split(separator: "/").contains("..") else {
+                    throw UnpackError(errorDescription: "В архиве недопустимый путь: \(relative)")
+                }
+                let target = destination.appendingPathComponent(relative)
+                if entry.type == .directory {
+                    try fm.createDirectory(at: target, withIntermediateDirectories: true)
+                    continue
+                }
+                try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                _ = fm.createFile(atPath: target.path, contents: nil)
+                let handle = try FileHandle(forWritingTo: target)
+                defer { try? handle.close() }
+                _ = try archive.extract(entry, bufferSize: 1 << 20, skipCRC32: true) { data in
+                    try handle.write(contentsOf: data)
+                    done += Int64(data.count)
+                    report()
+                }
+            }
+        } catch {
+            // a half unpacked package would still be listed as a VM
+            try? fm.removeItem(at: destination)
+            throw error
+        }
+        return destination
+    }
+}
+
+/// Downloads the LineageOS archive with UTM's downloader (progress, retries) and unpacks it with `VMZip`.
+final class VMAndroidDownloadTask: UTMDownloadTask {
+    init(url: URL) {
+        super.init(for: url, named: "Android")
+    }
+
+    override func processCompletedDownload(at location: URL, response: URLResponse?) async throws -> any UTMVirtualMachine {
+        let zip = VMAndroidImage.cachedZipURL
+        try? fileManager.removeItem(at: zip)
+        try fileManager.moveItem(at: location, to: zip)
+        let utmURL = try VMZip.extractUTM(zipURL: zip, into: UTMData.defaultStorageUrl)
+        try? fileManager.removeItem(at: zip)
+        let vm = try await VMData(url: utmURL)
+        return await vm.wrapped!
+    }
 }
 
 /// Name and version of the installed Android, read from the VM notes written by the LineageOS build.
@@ -545,6 +658,14 @@ final class VMShell: ObservableObject {
 
     @Published var message: VMShellMessage?
     @Published var isPreparing = false
+    /// Running download of the Android image.
+    @Published private(set) var downloadTask: VMAndroidDownloadTask?
+    /// 0...1 while the image is being unpacked.
+    @Published var unpackProgress: Double?
+
+    var pendingDownload: UTMPendingVirtualMachine? { downloadTask?.pendingVM }
+
+    var isInstallingAndroid: Bool { downloadTask != nil || unpackProgress != nil }
 
     func androidVM(in data: UTMData) -> VMData? {
         data.virtualMachines.first { vm in
@@ -566,14 +687,56 @@ final class VMShell: ObservableObject {
         }
     }
 
-    var hasSpaceForDownload: Bool {
-        VMDevice.storage().free > VMAndroidImage.downloadSize + VMAndroidImage.unpackedSize + 500_000_000
+    var spaceNeededForInstall: Int64 {
+        let download = VMAndroidImage.hasCompleteCachedZip ? 0 : VMAndroidImage.downloadSize
+        return download + VMAndroidImage.unpackedSize + 300_000_000
     }
 
+    var hasSpaceForDownload: Bool {
+        VMDevice.storage().free > spaceNeededForInstall
+    }
+
+    /// Downloads (or reuses an already downloaded archive) and unpacks Android into the VM library.
     func download(into data: UTMData) {
-        guard data.pendingVMs.isEmpty else { return }
+        guard !isInstallingAndroid else { return }
         UIApplication.shared.isIdleTimerDisabled = true
-        data.downloadUTMZip(from: VMAndroidImage.downloadURL)
+        if VMAndroidImage.hasCompleteCachedZip {
+            unpackProgress = 0
+            let zip = VMAndroidImage.cachedZipURL
+            let folder = UTMData.defaultStorageUrl
+            Task {
+                do {
+                    _ = try await Task.detached(priority: .userInitiated) {
+                        try VMZip.extractUTM(zipURL: zip, into: folder)
+                    }.value
+                    try? FileManager.default.removeItem(at: zip)
+                    await data.listRefresh()
+                } catch {
+                    message = .error("Не удалось распаковать Android: \(error.localizedDescription)")
+                }
+                unpackProgress = nil
+                UIApplication.shared.isIdleTimerDisabled = false
+            }
+            return
+        }
+        let task = VMAndroidDownloadTask(url: VMAndroidImage.downloadURL)
+        downloadTask = task
+        Task {
+            do {
+                if try await task.download() != nil {
+                    await data.listRefresh()
+                }
+            } catch {
+                message = .error("Не удалось скачать или распаковать Android: \(error.localizedDescription)")
+            }
+            downloadTask = nil
+            unpackProgress = nil
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
+    }
+
+    func cancelDownload() {
+        downloadTask?.cancel()
     }
 
     /// Writes the current settings into the VM and its boot loader, then boots it.
