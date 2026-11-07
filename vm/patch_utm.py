@@ -111,6 +111,11 @@ t = read(p)
 if 'VM: no toolbar' not in t:
     t = replace_once(t, '            if isInteractive && state.isRunning {\n                VMToolbarView(state: $state)\n            }\n',
                      '            // VM: no toolbar, the screen belongs to Android only\n', 'VMToolbarView in VMWindowView')
+    # status bar, home indicator and edge gestures go to Android for the whole window,
+    # also while it is still booting and before the display is connected
+    t = replace_once(t, '        .statusBarHidden(true)\n',
+                     '        .statusBarHidden(true)\n        .prefersPersistentSystemOverlaysHidden()\n        .defersSystemGesturesOnAllEdges()\n',
+                     'statusBarHidden in VMWindowView')
     write(p, t)
 
 # 4. Info.plist: name and portrait phone only ---------------------------------------------
